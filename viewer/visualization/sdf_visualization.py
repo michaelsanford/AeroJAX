@@ -14,10 +14,12 @@ class SDFVisualization:
         self.vort_sdf = vort_sdf
         self.parent_vis = parent_vis  # Reference to FlowVisualization for bounds
         self.is_visible = False  # Track visibility state - hidden by default (using filled polygon instead)
+        self._rendered_key = None  # (mask object, bounds) last drawn; avoids per-frame rebuilds
     
     def set_visibility(self, is_visible):
         """Set visibility of SDF overlay"""
         self.is_visible = is_visible
+        self._rendered_key = None
         if self.vel_sdf is not None:
             self.vel_sdf.setVisible(is_visible)
         if self.vort_sdf is not None:
@@ -34,8 +36,21 @@ class SDFVisualization:
                 not hasattr(self.vel_sdf, 'setImage') or not hasattr(self.vort_sdf, 'setImage')):
                 return
             
+            # Hidden overlay: nothing to draw (set_visibility forces a redraw when shown)
+            if not self.is_visible:
+                return
+
             # Get actual mask from solver
             mask_array = solver.mask
+            if self.parent_vis is not None and hasattr(self.parent_vis, 'current_lx'):
+                bounds = (self.parent_vis.current_lx, self.parent_vis.current_y_min, self.parent_vis.current_y_max)
+            else:
+                bounds = None
+            # JAX arrays are immutable, so an unchanged mask object means unchanged contents.
+            # Holding the reference (not its id) prevents id reuse after garbage collection.
+            if self._rendered_key is not None and self._rendered_key[0] is mask_array and self._rendered_key[1] == bounds:
+                return
+            self._rendered_key = (mask_array, bounds)
             
             # Convert to numpy if it's a JAX array
             if hasattr(mask_array, 'toArray'):

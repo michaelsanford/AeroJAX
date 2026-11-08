@@ -1382,13 +1382,13 @@ class FlowVisualization:
 
         # Store current data for cursor readout (always store, even if not visible)
         if vel_mag_data is not None:
-            self.current_vel_data = np.array(vel_mag_data)
+            self.current_vel_data = np.asarray(vel_mag_data)
         if vort_data is not None:
-            self.current_vort_data = np.array(vort_data)
+            self.current_vort_data = np.asarray(vort_data)
         if pressure_data is not None:
-            self.current_pressure_data = np.array(pressure_data)
+            self.current_pressure_data = np.asarray(pressure_data)
         if div_data is not None:
-            self.current_div_data = np.array(div_data)
+            self.current_div_data = np.asarray(div_data)
 
         # Update cursor readouts if cursor is stationary (live updates)
         if self.vel_cursor_pos is not None:
@@ -1627,7 +1627,7 @@ class FlowVisualization:
             # PyQtGraph: image[ny][nx] where rows=y, cols=x
             # For LDC, lid is at top (last y-index in simulation), so don't transpose
             # Convert to numpy array first to avoid JAX shape issues during resize
-            pressure_data_correct = np.array(pressure_data)
+            pressure_data_correct = np.asarray(pressure_data)
 
             # Convert to float32 to prevent levels error
             if pressure_data_correct.dtype != np.float32:

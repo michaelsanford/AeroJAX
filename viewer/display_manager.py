@@ -348,7 +348,8 @@ class DisplayManager:
         """Update the display with latest simulation data."""
         import time
         t_start = time.time()
-        
+        vel_mag_data = None
+
         try:
             data = self.sim_controller.get_latest_data()
             if data is None:
@@ -357,26 +358,17 @@ class DisplayManager:
             
             t_get_data = time.time()
             
-            # TEMPORARY: Get arrays directly instead of from shared buffers
+            # Host arrays copied by the simulation worker (never read solver state on the GUI thread)
             vel_mag_data = data.get('vel_mag')
             vort_data = data.get('vort')
             div_data = data.get('div')
             scalar_data = data.get('scalar')
-            
-            # Get visualization data (commented out temporarily)
-            # shared_buffers = data.get('shared_buffers', {})
-            # velocity_buffer = shared_buffers.get('vel_mag')
-            # vorticity_buffer = shared_buffers.get('vort')
-            
+            pressure_data = data.get('pressure')
+
             t_get_buffers = time.time()
-            
-            # Data is available - proceed with visualization update
-            
+
             # Update plots with error handling
             try:
-                # Get pressure data from solver
-                pressure_data = self.solver.current_pressure if hasattr(self.solver, 'current_pressure') else None
-
                 t_update_viz = time.time()
                 self.flow_viz.update_visualization(
                     vel_mag_data if vel_mag_data is not None else None,
@@ -395,186 +387,28 @@ class DisplayManager:
                 print(f"Warning: Visualization update failed: {viz_error}")
                 traceback.print_exc()
                 # Continue running even if visualization fails
-                
-                # Update scalar visualization (dye)
-                t_dye_start = time.time()
+
+            # Dye injection while the button is held, and particle advection.
+            # (The dye/scalar image itself is drawn by update_visualization from the worker payload;
+            # change metrics and airfoil metrics are pushed to the UI by the metrics callback.)
+            try:
                 if self.config.viz_config.show_dye:
-                    # Continuous dye injection while button is held
                     if self.inject_dye_pressed:
                         self.inject_dye_at_slider_position()
 
-                    if self.flow_viz.use_particles:
-                        # Update particles with velocity field
+                    if self.flow_viz.use_particles and data.get('u') is not None:
                         # Update multiple times to match simulation speed (frame skip)
                         frame_skip = self.sim_controller.update_every if hasattr(self.sim_controller, 'update_every') else 1
-                        u_np = np.array(self.solver.u)
-                        v_np = np.array(self.solver.v)
-                        X_np = np.array(self.solver.grid.X)
-                        Y_np = np.array(self.solver.grid.Y)
+                        if not hasattr(self, '_particle_grid') or self._particle_grid[0] is not self.solver.grid:
+                            self._particle_grid = (self.solver.grid, np.array(self.solver.grid.X), np.array(self.solver.grid.Y))
+                        _, X_np, Y_np = self._particle_grid
                         domain_bounds = (0, self.solver.grid.lx, 0, self.solver.grid.ly)
-                        
-                        # Update particles multiple times to match simulation steps
                         for _ in range(frame_skip):
-                            self.flow_viz.update_particles(u_np, v_np, X_np, Y_np, 
-                                                         self.solver.grid.dx, self.solver.grid.dy, 
-                                                         self.solver.dt, domain_bounds)
-                    else:
-                        # Update dye or thermal scalar field
-                        if hasattr(self.solver, 'lbm_params') and getattr(self.solver.lbm_params, 'enable_thermal', False) and hasattr(self.solver, 'T'):
-                            scalar_data = np.array(self.solver.T)  # No transpose - use same orientation as velocity
-                        elif hasattr(self.solver, 'c'):
-                            scalar_data = np.array(self.solver.c)
-                        else:
-                            scalar_data = None
-
-                        if scalar_data is not None:
-                            # Add rect parameter to map grid coordinates to physical coordinates
-                            rect = (0, 0, self.solver.grid.lx, self.solver.grid.ly)
-                            self.flow_viz.scalar_img.setImage(scalar_data, levels=[0, 1], autoLevels=False, rect=rect)
-                t_dye_end = time.time()
-                
-                # Update L2 change plot (formerly L2 error)
-                t_l2_start = time.time()
-                if hasattr(self.solver, 'history') and 'l2_change' in self.solver.history:
-                    l2_changes = self.solver.history['l2_change']
-                    rms_changes = self.solver.history.get('rms_change', [])
-                    change_99p_list = self.solver.history.get('change_99p', [])
-                    l2_changes_u = self.solver.history.get('l2_change_u', [])
-                    l2_changes_v = self.solver.history.get('l2_change_v', [])
-                    times = self.solver.history['time']
-                    # Initialize change metrics to prevent UnboundLocalError
-                    max_changes = []
-                    rel_changes = []
-                    rms_divergence = []
-                    time_to_use = 0.0
-
-                    if l2_changes and times:
-                        # Get all change metrics from solver history
-                        max_changes = self.solver.history.get('max_change', [])
-                        rel_changes = self.solver.history.get('rel_change', [])
-                        rms_divergence = self.solver.history.get('rms_divergence', [])
-
-                        # Ensure time and change arrays have same length
-                        if len(times) >= len(l2_changes):
-                            time_to_use = times[-1]
-                        else:
-                            time_to_use = times[-1] if times else 0.0
-
-                        # Only update error plot if metrics checkbox is checked
-                        if hasattr(self, 'info_panel') and self.info_panel is not None and self.info_panel.diagnostics_checkbox.isChecked():
-                            try:
-                                # Always pass all change metrics, using L2 change as fallback for missing values
-                                max_change = max_changes[-1] if max_changes and len(max_changes) > 0 else l2_changes[-1]
-                                rel_change = rel_changes[-1] if rel_changes and len(rel_changes) > 0 else l2_changes[-1]
-                                rms_div = rms_divergence[-1] if rms_divergence and len(rms_divergence) > 0 else 0.0
-                                l2_change_u = l2_changes_u[-1] if l2_changes_u and len(l2_changes_u) > 0 else l2_changes[-1]
-                                l2_change_v = l2_changes_v[-1] if l2_changes_v and len(l2_changes_v) > 0 else l2_changes[-1]
-                                rms_change = rms_changes[-1] if rms_changes and len(rms_changes) > 0 else 0.0
-                                change_99p = change_99p_list[-1] if change_99p_list and len(change_99p_list) > 0 else 0.0
-
-                                self.flow_viz.update_l2_error(
-                                    l2_changes[-1], time_to_use,
-                                    max_change, rel_change, l2_change_u, l2_change_v,
-                                    rms_change, change_99p
-                                )
-                            except (IndexError, ValueError):
-                                # Skip update if arrays are empty or mismatched
-                                pass
-
-                # Update InfoPanel with change metrics (copyable with Ctrl+C)
-                if hasattr(self, 'info_panel') and self.info_panel is not None:
-                    # Only update plots if metrics checkbox is checked
-                    if self.info_panel.diagnostics_checkbox.isChecked():
-                        try:
-                            max_change = max_changes[-1] if max_changes and len(max_changes) > 0 else l2_changes[-1]
-                            rel_change = rel_changes[-1] if rel_changes and len(rel_changes) > 0 else l2_changes[-1]
-                            l2_change_u = l2_changes_u[-1] if l2_changes_u and len(l2_changes_u) > 0 else l2_changes[-1]
-                            l2_change_v = l2_changes_v[-1] if l2_changes_v and len(l2_changes_v) > 0 else l2_changes[-1]
-                            rms_change = rms_changes[-1] if rms_changes and len(rms_changes) > 0 else 0.0
-                            change_99p = change_99p_list[-1] if change_99p_list and len(change_99p_list) > 0 else 0.0
-                            self.info_panel.update_error_metrics(
-                                l2_changes[-1], rms_change, max_change, change_99p, rel_change, l2_change_u, l2_change_v
-                            )
-                        except (IndexError, ValueError):
-                            # Skip update if arrays are empty or mismatched
-                            pass
-                
-                # Update airfoil metrics if available
-                if 'airfoil_metrics' in self.solver.history:
-                    airfoil_data = self.solver.history['airfoil_metrics']
-                    if airfoil_data['CL']:
-                        airfoil_x = self.solver.sim_params.naca_x if hasattr(self.solver.sim_params, 'naca_x') else 2.5
-                        chord_length = self.solver.sim_params.naca_chord if hasattr(self.solver.sim_params, 'naca_chord') else 3.0
-
-                        # Get time-averaged values if available
-                        avg_cl = None
-                        avg_cd = None
-                        strouhal = None
-                        if 'time_averaged' in self.solver.history and self.solver.history['time_averaged']['CL']:
-                            avg_cl = self.solver.history['time_averaged']['CL'][-1]
-                            avg_cd = self.solver.history['time_averaged']['CD'][-1]
-                            strouhal = self.solver.history['time_averaged']['strouhal'][-1]
-
-                        # Determine obstacle type for display - check sim_params first
-                        flow_type = getattr(self.solver.sim_params, 'flow_type', 'von_karman')
-                        if flow_type == 'von_karman':
-                            # Check sim_params.obstacle_type first for explicit obstacle type
-                            obstacle_type = getattr(self.solver.sim_params, 'obstacle_type', 'cylinder')
-                            
-                            # If obstacle_type is naca_airfoil, verify with naca_airfoil param
-                            if obstacle_type == 'naca_airfoil':
-                                naca_airfoil = getattr(self.solver.sim_params, 'naca_airfoil', None)
-                                if naca_airfoil is None or not naca_airfoil.startswith('NACA'):
-                                    # Fallback to geometry check if naca_airfoil param is invalid
-                                    if hasattr(self.solver.geom, 'radius') and self.solver.geom.radius > 0:
-                                        obstacle_type = 'cylinder'
-                        else:
-                            obstacle_type = getattr(self.solver.sim_params, 'obstacle_type', 'unknown')
-
-                        # Get cylinder diameter and center if needed
-                        cylinder_diameter = 0.36
-                        cylinder_center_x = 5.0
-                        if obstacle_type == 'cylinder':
-                            radius = getattr(self.solver.geom, 'radius', 0.18)
-                            cylinder_diameter = float(2.0 * radius)
-                            # Handle both 0D and 1D arrays for center_x
-                            center_x_array = self.solver.geom.center_x
-                            if hasattr(center_x_array, 'ndim') and center_x_array.ndim > 0:
-                                cylinder_center_x = float(center_x_array[0])
-                            else:
-                                cylinder_center_x = float(center_x_array)
-
-                        self.info_panel.update_airfoil_metrics(
-                            cl=airfoil_data['CL'][-1],
-                            stagnation=airfoil_data['stagnation_x'][-1] if airfoil_data['stagnation_x'] else None,
-                            separation=airfoil_data['separation_x'][-1] if airfoil_data['separation_x'] else None,
-                            cp_min=airfoil_data['Cp_min'][-1] if airfoil_data['Cp_min'] else None,
-                            wake_deficit=airfoil_data['wake_deficit'][-1] if airfoil_data['wake_deficit'] else None,
-                            cd=airfoil_data['CD'][-1] if airfoil_data['CD'] else None,
-                            avg_cl=avg_cl,
-                            avg_cd=avg_cd,
-                            strouhal=strouhal,
-                            airfoil_x=airfoil_x,
-                            chord_length=chord_length,
-                            obstacle_type=obstacle_type,
-                            cylinder_diameter=cylinder_diameter,
-                            cylinder_center_x=cylinder_center_x
-                        )
-                t_l2_end = time.time()
-                        
-            except Exception as viz_error:
-                print(f"Warning: Visualization update failed: {viz_error}")
-                # Continue running even if visualization fails
-                
-            # Update obstacle outlines periodically
-            t_outline_start = time.time()
-            try:
-                if hasattr(self, 'obstacle_renderer') and self.obstacle_renderer:
-                    self.obstacle_renderer.update_obstacle_outlines(self.solver)
-            except Exception as outline_error:
-                print(f"Warning: Outline update failed: {outline_error}")
-                # Continue running even if outline update fails
-            t_outline_end = time.time()
+                            self.flow_viz.update_particles(data['u'], data['v'], X_np, Y_np,
+                                                           self.solver.grid.dx, self.solver.grid.dy,
+                                                           self.solver.dt, domain_bounds)
+            except Exception as dye_error:
+                print(f"Warning: Dye/particle update failed: {dye_error}")
                 
             # Update LDC validation overlay if enabled
             t_ldc_start = time.time()
@@ -711,8 +545,9 @@ class DisplayManager:
             self.info_panel.dt_mode_label.setText(f"DT Mode: {dt_mode}")
         
         # Handle video recording
-        if self.recording_manager.is_recording and velocity_buffer is not None:
-            self.recording_manager.capture_frame(velocity_buffer.array)
+        if self.recording_manager.is_recording and vel_mag_data is not None:
+            # (nx, ny) field -> upright image (rows = y, top row = max y)
+            self.recording_manager.capture_frame(np.asarray(vel_mag_data).T[::-1])
         
         # Update frame rate counter
         self._update_frame_rate_display()
