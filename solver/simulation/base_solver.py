@@ -31,7 +31,7 @@ rho = 1.0  # Fluid density
 # Import from submodules
 from .initializers import _initialize_von_karman_flow, _initialize_cavity_flow, _initialize_taylor_green_flow
 from .mask_generator import _compute_mask
-from .step_handlers import _step, _step_collocated, _step_mac, get_step_jit
+from .step_handlers import _step, _step_collocated, _step_mac, get_step_jit, step_dynamic_params, _step_static_key
 from .flow_control import apply_flow_type, set_obstacle_type, update_naca_angle, inject_dye, set_adaptive_dt, set_fixed_dt
 from .visualization_step import step_pure_profiled, step_for_visualization
 
@@ -299,7 +299,6 @@ class BaselineSolver:
         
         # Grid-consistent ε
         from ..params import compute_eps_multiplier
-        jax.clear_caches()  # Clear JIT cache to ensure new code is compiled
         if self.sim_params.auto_eps_multiplier:
             self.sim_params.eps_multiplier = compute_eps_multiplier(self.flow.Re)
             print(f"Auto-computed eps_multiplier = {self.sim_params.eps_multiplier} from Re = {self.flow.Re:.1f}")
@@ -418,6 +417,8 @@ BaselineSolver._step = _step
 BaselineSolver._step_collocated = _step_collocated
 BaselineSolver._step_mac = _step_mac
 BaselineSolver.get_step_jit = get_step_jit
+BaselineSolver.step_dynamic_params = step_dynamic_params
+BaselineSolver._step_static_key = _step_static_key
 BaselineSolver.apply_flow_type = apply_flow_type
 BaselineSolver.set_obstacle_type = set_obstacle_type
 BaselineSolver.update_naca_angle = update_naca_angle

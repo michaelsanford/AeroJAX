@@ -61,7 +61,6 @@ def apply_flow_type(self, flow_type: str):
         delattr(self, 'mask')
     
     self._jit_cache = {}
-    jax.clear_caches()
     import gc
     gc.collect()
     
@@ -75,7 +74,7 @@ def apply_flow_type(self, flow_type: str):
     else:
         self._initialize_von_karman_flow()
     
-    self._step_jit = jax.jit(self._step)
+    self._step_jit = self.get_step_jit()
     
     # Use appropriate divergence function based on flow type
     from ..operators import vorticity_nonperiodic, divergence_nonperiodic, vorticity, divergence
@@ -125,7 +124,6 @@ def set_obstacle_type(self, obstacle_type: str, **kwargs):
     
     # Clear JAX cache to force re-tracing with new obstacle type
     import jax
-    jax.clear_caches()
     
     # Clear JIT cache to force recompilation of step function
     self._jit_cache = {}
@@ -165,7 +163,7 @@ def update_naca_angle(self, angle_of_attack: float, recompute: bool = True, clea
     Args:
         angle_of_attack: New angle in degrees
         recompute: If True, recompute mask. If False, only update parameter.
-        clear_cache: If True, clear JAX cache to force re-tracing (expensive, use on release).
+        clear_cache: Ignored; kept for API compatibility (mask/SDF are traced step inputs).
     """
     if self.sim_params.obstacle_type != 'naca_airfoil':
         print("Warning: Cannot update angle - current obstacle is not a NACA airfoil")
@@ -174,10 +172,6 @@ def update_naca_angle(self, angle_of_attack: float, recompute: bool = True, clea
     self.sim_params.naca_angle = angle_of_attack
     
     if recompute:
-        if clear_cache:
-            import jax
-            jax.clear_caches()
-        
         self.mask = self._compute_mask()
         # Apply mask to velocity fields
         self.u = self.u * self.mask
@@ -247,7 +241,6 @@ def set_adaptive_dt(self):
             print(f"CFL-based adaptive timestep enabled with cfl_target={self.sim_params.max_cfl}, dt_min={self.sim_params.dt_min}, dt_max={self.sim_params.dt_max}")
         except ImportError:
             print("Warning: CFLAdaptiveController not available, adaptive dt may not work properly")
-    jax.clear_caches()
     if hasattr(self, '_step_jit'):
         delattr(self, '_step_jit')
     self._step_jit = self.get_step_jit()  # Recreate JIT function
@@ -267,7 +260,6 @@ def set_fixed_dt(self, dt: float):
     self.dt = dt
     self.sim_params.fixed_dt = dt
     print(f"Fixed timestep set to {dt}")
-    jax.clear_caches()
     if hasattr(self, '_step_jit'):
         delattr(self, '_step_jit')
     self._step_jit = self.get_step_jit()  # Recreate JIT function

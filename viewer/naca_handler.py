@@ -44,7 +44,6 @@ class NACAHandler:
             
             # Recompile solver with new geometry
             self.solver.mask = self.solver._compute_mask()
-            jax.clear_caches()
             self.solver._step_jit = self.solver.get_step_jit()
             
             # Update obstacle outlines immediately

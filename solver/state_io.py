@@ -319,8 +319,6 @@ class StateIO:
             solver.history = state_dict['metadata']['history']
             solver.iteration = state_dict['metadata']['iteration']
         
-        # CRITICAL: Clear JIT cache to force recompilation with new state
-        jax.clear_caches()
         
         # Re-initialize step JIT with new state
         try:

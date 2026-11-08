@@ -211,11 +211,13 @@ def step_for_visualization(self, compute_vorticity: bool = True, compute_diverge
         u, v, vort, div (divergence may be None if not requested)
     """
     # Perform step using JIT-compiled step function
-    u_new, v_new, p = self._step_jit(self.u, self.v, self.mask, self.dt)
+    # Re-fetch so static config changes (grid type, solver, LES...) pick the matching compiled step
+    self._step_jit = self.get_step_jit()
+    u_new, v_new, p = self._step_jit(self.u, self.v, self.mask, self.dt, self.step_dynamic_params())
     
-    # Update velocity fields
-    self.u_prev = jnp.copy(self.u)
-    self.v_prev = jnp.copy(self.v)
+    # Update velocity fields (JAX arrays are immutable, no copy needed)
+    self.u_prev = self.u
+    self.v_prev = self.v
     self.u = u_new
     self.v = v_new
     self.current_pressure = p

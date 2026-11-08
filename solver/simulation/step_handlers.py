@@ -59,12 +59,14 @@ except ImportError:
     MAC_OPERATORS_AVAILABLE = False
 
 
-def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float, dyn: dict) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Single time step using projection method for collocated grid"""
     dx, dy = self.grid.dx, self.grid.dy
     
     # Compute SGS eddy viscosity (constant Smagorinsky for stability and performance)
-    nu_total = self.flow.nu
+    nu = dyn['nu']
+    U_inf = dyn['U_inf']
+    nu_total = nu
     nu_sgs = None
     
     if self.sim_params.use_les:
@@ -72,17 +74,17 @@ def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt
         if self.sim_params.les_model == 'dynamic_smagorinsky':
             nu_sgs, _ = dynamic_smagorinsky(u, v, dx, dy, delta)
         else:
-            nu_sgs = constant_smagorinsky(u, v, dx, dy, delta, self.sim_params.smagorinsky_constant)
-        nu_total = self.flow.nu + nu_sgs
+            nu_sgs = constant_smagorinsky(u, v, dx, dy, delta, dyn['smagorinsky_constant'])
+        nu_total = nu + nu_sgs
     
     # Advection
     fast_mode = getattr(self.sim_params, 'fast_mode', False)
-    brinkman_eta = self.sim_params.brinkman_eta if hasattr(self.sim_params, 'brinkman_eta') else 0.01
+    brinkman_eta = dyn['brinkman_eta']
     advection_mask = mask  # Use mask for all flow types including LDC
     
     from advection_schemes.rk3_simple_new import rk_step_unified
-    u_star, v_star = rk_step_unified(u, v, dt, nu_total, dx, dy, advection_mask, sdf=self.sdf, 
-                                     U_inf=self.flow.U_inf, nu_sgs=nu_sgs, 
+    u_star, v_star = rk_step_unified(u, v, dt, nu_total, dx, dy, advection_mask, sdf=dyn['sdf'], 
+                                     U_inf=U_inf, nu_sgs=nu_sgs, 
                                      nu_hyper_ratio=self.nu_hyper_ratio, 
                                      slip_walls=self.slip_walls, 
                                      fast_mode=fast_mode, 
@@ -136,18 +138,18 @@ def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt
     else:
         dp_dx, dp_dy = grad_x(p, dx), grad_y(p, dy)
     
-    u_corr = u_star - self.dt * dp_dx
-    v_corr = v_star - self.dt * dp_dy
+    u_corr = u_star - dt * dp_dx
+    v_corr = v_star - dt * dp_dy
 
     # Apply boundary conditions (Brinkman is now integrated into RHS computation)
     if self.sim_params.flow_type == 'von_karman':
         # Startup ramp - use cubic (smoothstep) for gentler initial ramp
-        if self.iteration >= self.startup_ramp_steps:
-            inlet_velocity = self.flow.U_inf
-        else:
-            t = self.iteration / self.startup_ramp_steps
+        if self.startup_ramp_steps > 0:
+            t = jnp.clip(dyn['iteration'] / self.startup_ramp_steps, 0.0, 1.0)
             ramp_factor = 3 * t**2 - 2 * t**3  # Cubic smoothstep (zero derivative at endpoints)
-            inlet_velocity = self.flow.U_inf * ramp_factor
+            inlet_velocity = U_inf * ramp_factor
+        else:
+            inlet_velocity = U_inf
 
         # Apply inlet BC (excluding corners - wall BC takes precedence)
         u_corr = u_corr.at[0, 1:-1].set(inlet_velocity)  # Inlet, excluding corners
@@ -161,7 +163,7 @@ def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt
         v_corr = v_corr.at[:, -1].set(0.0)
     elif self.sim_params.flow_type == 'lid_driven_cavity':
         # Apply lid-driven cavity boundary conditions
-        lid_velocity = self.flow.U_inf if hasattr(self.flow, 'U_inf') else 1.0
+        lid_velocity = U_inf
         # Top wall: moving lid
         u_corr = u_corr.at[:, -1].set(lid_velocity)
         v_corr = v_corr.at[:, -1].set(0.0)
@@ -175,7 +177,7 @@ def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt
         u_corr = u_corr.at[-1, :].set(0.0)
         v_corr = v_corr.at[-1, :].set(0.0)
     elif self.sim_params.flow_type == 'taylor_green':
-        u_corr, v_corr = apply_taylor_green_boundary_conditions(u_corr, v_corr, self.flow.U_inf, 2*jnp.pi, self.grid.nx, self.grid.ny)
+        u_corr, v_corr = apply_taylor_green_boundary_conditions(u_corr, v_corr, U_inf, 2*jnp.pi, self.grid.nx, self.grid.ny)
     
     # Hard mask zeroing: force velocities to zero inside solid (mask < 0.5)
     # This is needed because mask has smooth sigmoid transition, so multiplication doesn't fully zero
@@ -185,11 +187,13 @@ def _step_collocated(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt
     return u_corr, v_corr, p
 
 
-def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float, dyn: dict) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Single time step using projection method for MAC staggered grid"""
     dx, dy = self.grid.dx, self.grid.dy
 
     # Compute SGS eddy viscosity (constant Smagorinsky for stability and performance)
+    nu = dyn['nu']
+    U_inf = dyn['U_inf']
     nu_sgs_field = None
 
     if self.sim_params.use_les:
@@ -200,15 +204,15 @@ def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float
         if self.sim_params.les_model == 'dynamic_smagorinsky':
             nu_sgs_field, _ = dynamic_smagorinsky(u_center, v_center, dx, dy, delta)
         else:
-            nu_sgs_field = constant_smagorinsky(u_center, v_center, dx, dy, delta, self.sim_params.smagorinsky_constant)
+            nu_sgs_field = constant_smagorinsky(u_center, v_center, dx, dy, delta, dyn['smagorinsky_constant'])
     
     # Advection
     fast_mode = getattr(self.sim_params, 'fast_mode', False)
-    brinkman_eta = self.sim_params.brinkman_eta if hasattr(self.sim_params, 'brinkman_eta') else 0.01
+    brinkman_eta = dyn['brinkman_eta']
     advection_mask = mask  # Use mask for all flow types including LDC
 
-    u_star, v_star = rk_step_unified_mac(u, v, dt, self.flow.nu, dx, dy, advection_mask,
-                                         U_inf=self.flow.U_inf, nu_sgs=nu_sgs_field,
+    u_star, v_star = rk_step_unified_mac(u, v, dt, nu, dx, dy, advection_mask,
+                                         U_inf=U_inf, nu_sgs=nu_sgs_field,
                                          nu_hyper_ratio=self.nu_hyper_ratio,
                                          slip_walls=self.slip_walls,
                                          fast_mode=fast_mode,
@@ -249,18 +253,18 @@ def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float
         dp_dx = grad_x_staggered(p, dx)
         dp_dy = grad_y_staggered(p, dy)
     
-    u_corr = u_star - self.dt * dp_dx
-    v_corr = v_star - self.dt * dp_dy
+    u_corr = u_star - dt * dp_dx
+    v_corr = v_star - dt * dp_dy
 
     # Apply boundary conditions (Brinkman is now integrated into RHS computation)
     if self.sim_params.flow_type == 'von_karman':
         # Startup ramp - use cubic (smoothstep) for gentler initial ramp
-        if self.iteration >= self.startup_ramp_steps:
-            inlet_velocity = self.flow.U_inf
-        else:
-            t = self.iteration / self.startup_ramp_steps
+        if self.startup_ramp_steps > 0:
+            t = jnp.clip(dyn['iteration'] / self.startup_ramp_steps, 0.0, 1.0)
             ramp_factor = 3 * t**2 - 2 * t**3  # Cubic smoothstep (zero derivative at endpoints)
-            inlet_velocity = self.flow.U_inf * ramp_factor
+            inlet_velocity = U_inf * ramp_factor
+        else:
+            inlet_velocity = U_inf
 
         # Apply inlet BC (excluding corners - wall BC takes precedence)
         u_corr = u_corr.at[0, 1:-1].set(inlet_velocity)  # Inlet, excluding corners
@@ -274,7 +278,7 @@ def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float
         v_corr = v_corr.at[:, -1].set(0.0)
     elif self.sim_params.flow_type == 'lid_driven_cavity':
         # Apply lid-driven cavity boundary conditions
-        lid_velocity = self.flow.U_inf if hasattr(self.flow, 'U_inf') else 1.0
+        lid_velocity = U_inf
         # Top wall: moving lid
         u_corr = u_corr.at[:, -1].set(lid_velocity)
         v_corr = v_corr.at[:, -1].set(0.0)
@@ -288,28 +292,55 @@ def _step_mac(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float
         u_corr = u_corr.at[-1, :].set(0.0)
         v_corr = v_corr.at[-1, :].set(0.0)
     elif self.sim_params.flow_type == 'taylor_green':
-        u_corr, v_corr = apply_taylor_green_boundary_conditions(u_corr, v_corr, self.flow.U_inf, 2*jnp.pi, self.grid.nx, self.grid.ny)
+        u_corr, v_corr = apply_taylor_green_boundary_conditions(u_corr, v_corr, U_inf, 2*jnp.pi, self.grid.nx, self.grid.ny)
     
     return u_corr, v_corr, p
 
 
-def _step(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+def _step(self, u: jnp.ndarray, v: jnp.ndarray, mask: jnp.ndarray, dt: float, dyn: dict) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Single time step using projection method - delegates to grid-specific step function"""
     if self.sim_params.grid_type == 'mac' and MAC_ADVECTION_AVAILABLE and MAC_OPERATORS_AVAILABLE and MAC_PRESSURE_AVAILABLE:
-        return self._step_mac(u, v, mask, dt)
+        return self._step_mac(u, v, mask, dt, dyn)
     else:
-        return self._step_collocated(u, v, mask, dt)
+        return self._step_collocated(u, v, mask, dt, dyn)
+
+
+def step_dynamic_params(self) -> dict:
+    """Runtime parameters passed to the jitted step as traced values.
+
+    Changing any of these takes effect on the next step without recompiling.
+    """
+    return {
+        'sdf': self.sdf,
+        'nu': self.flow.nu,
+        'U_inf': self.flow.U_inf,
+        'brinkman_eta': getattr(self.sim_params, 'brinkman_eta', 0.01),
+        'smagorinsky_constant': self.sim_params.smagorinsky_constant,
+        'iteration': self.iteration,
+    }
+
+
+def _step_static_key(self) -> tuple:
+    """Everything _step reads from self at trace time (structure, not values)."""
+    sp = self.sim_params
+    return (sp.grid_type, sp.flow_type, sp.advection_scheme, sp.pressure_solver,
+            sp.pressure_max_iter, sp.pressure_tolerance, sp.multigrid_v_cycles,
+            sp.use_les, sp.les_model, getattr(sp, 'fast_mode', False),
+            self.slip_walls, self.nu_hyper_ratio, self.startup_ramp_steps,
+            self.grid.nx, self.grid.ny, self.grid.dx, self.grid.dy,
+            id(getattr(self, 'nn_pressure_model', None)),
+            getattr(self, 'nn_pressure_architecture', None))
 
 
 def get_step_jit(self):
-    """Get cached JIT function"""
-    fast_mode = getattr(self.sim_params, 'fast_mode', False)
-    grid_type = self.sim_params.grid_type
-    key = (self.sim_params.advection_scheme, self.sim_params.pressure_solver,
-           self.sim_params.pressure_max_iter, self.grid.nx, self.grid.ny,
-           self.grid.dx, self.grid.dy, fast_mode, grid_type)
-    
+    """Get the jitted step for the current static configuration.
+
+    A fresh closure is jitted per static key, so JAX's trace cache can never
+    serve a stale trace and jax.clear_caches() is not needed after changes.
+    """
+    key = self._step_static_key()
     if key not in self._jit_cache:
-        self._jit_cache[key] = jax.jit(self._step)
-    
+        def step(u, v, mask, dt, dyn):
+            return self._step(u, v, mask, dt, dyn)
+        self._jit_cache[key] = jax.jit(step)
     return self._jit_cache[key]
