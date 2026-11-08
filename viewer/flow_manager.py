@@ -172,9 +172,6 @@ class FlowManager:
                             self.solver.sim_params.cow_x = new_cow_x
                         if new_cow_y is not None:
                             self.solver.sim_params.cow_y = new_cow_y
-                        # Clear JAX caches to force recompilation of cow mask with new position
-                        import jax
-                        jax.clear_caches()
                 elif current_obstacle_type_for_position == 'three_cylinder_array':
                     if current_three_cylinder_x != new_three_cylinder_x or current_three_cylinder_y != new_three_cylinder_y:
                         position_changed = True
@@ -197,9 +194,7 @@ class FlowManager:
                     except AttributeError:
                         # If is_running doesn't exist, assume simulation is not running
                         pass
-                    # Recompile step function with new mask (for collocated grids)
-                    self.solver._jit_cache = {}
-                    self.solver._step_jit = self.solver.get_step_jit()
+                    # Mask/SDF are traced step inputs, so the compiled step is reused as-is
                     
                     # Update obstacle preview for live feedback (always do this)
                     print(f"[STORE SYNC] Updating obstacle outlines")
@@ -300,7 +295,6 @@ class FlowManager:
             
             # Recompile solver
             self.solver.mask = self.solver._compute_mask()
-            jax.clear_caches()
             self.solver._step_jit = self.solver.get_step_jit()
             
             # Stop simulation completely before recreating shared buffers
@@ -314,14 +308,6 @@ class FlowManager:
             if hasattr(self, 'sim_controller') and hasattr(self.sim_controller, 'simulation_worker'):
                 if self.sim_controller.simulation_worker is not None:
                     self.sim_controller.simulation_worker.solver = self.solver
-            
-            # Recreate shared memory buffers with new grid dimensions
-            # For MAC grid, u has (nx+1, ny) and v has (nx, ny+1), but visualization uses cell-centered (nx, ny)
-            viz_nx = grid_nx
-            viz_ny = grid_ny
-            if hasattr(self, 'sim_controller') and hasattr(self.sim_controller, 'simulation_worker'):
-                if self.sim_controller.simulation_worker is not None:
-                    self.sim_controller.simulation_worker.recreate_shared_buffers(viz_nx, viz_ny)
             
             # Allow adaptive dt for all flow types
             if selected_flow == 'lid_driven_cavity' and self.solver.sim_params.adaptive_dt:
@@ -576,7 +562,6 @@ class FlowManager:
         print(f"Hyper-viscosity ratio updated to {nu_hyper_ratio:.3f}")
         # Clear JIT cache since nu_hyper_ratio is a static argument
         import jax
-        jax.clear_caches()
         if hasattr(self.solver, '_step_jit'):
             delattr(self.solver, '_step_jit')
         # Recreate _step_jit to ensure it exists for next step
@@ -588,7 +573,6 @@ class FlowManager:
         print(f"Wall boundary condition: {'Slip' if is_slip else 'No-slip'}")
         # Clear JIT cache to recompile with new boundary condition
         import jax
-        jax.clear_caches()
         if hasattr(self.solver, '_step_jit'):
             delattr(self.solver, '_step_jit')
         self.solver._step_jit = self.solver.get_step_jit()
@@ -606,7 +590,6 @@ class FlowManager:
         
         # Clear JIT cache and recompile since outlet_type is a static argument
         import jax
-        jax.clear_caches()
         self.solver._jit_cache = {}
         if hasattr(self.solver, '_step_jit'):
             delattr(self.solver, '_step_jit')
@@ -629,7 +612,6 @@ class FlowManager:
         
         # Clear JIT cache and recompile since bc_mode is a static argument
         import jax
-        jax.clear_caches()
         self.solver._jit_cache = {}
         if hasattr(self.solver, '_step_jit'):
             delattr(self.solver, '_step_jit')
@@ -802,7 +784,6 @@ class FlowManager:
         
         # Clear JIT cache and recompile since boundary config is a static argument
         import jax
-        jax.clear_caches()
         self.solver._jit_cache = {}
         if hasattr(self.solver, '_step_jit'):
             delattr(self.solver, '_step_jit')

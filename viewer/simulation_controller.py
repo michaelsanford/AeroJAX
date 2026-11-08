@@ -11,24 +11,9 @@ import logging
 import numpy as np
 import jax.numpy as jnp
 import jax
-import multiprocessing.shared_memory as shm
 from PyQt6.QtCore import QObject, pyqtSignal, Qt
 
 logger = logging.getLogger(__name__)
-
-
-class SharedData:
-    """Shared memory buffer for zero-copy data transfer"""
-    def __init__(self, shape, dtype=np.float32):
-        size = int(np.prod(shape) * np.dtype(dtype).itemsize)  # Convert to Python int
-        self.shm = shm.SharedMemory(create=True, size=size)
-        self.array = np.ndarray(shape, dtype=dtype, buffer=self.shm.buf)
-    
-    def cleanup(self):
-        """Clean up shared memory"""
-        if hasattr(self, 'shm'):
-            self.shm.close()
-            self.shm.unlink()
 
 
 class MetricsWorker(QObject):
@@ -67,8 +52,12 @@ class MetricsWorker(QObject):
         """Resume the metrics computation"""
         self.paused = False
 
-    def enqueue_data(self, u, v, pressure, mask, iteration):
+    def enqueue_data(self, u, v, pressure, mask, iteration, u_prev=None, v_prev=None):
         """Enqueue simulation data for metrics computation"""
+        # Skip non-metrics frames here, before any device-to-host copies happen
+        frame_skip = getattr(self.solver, 'metrics_frame_skip', 1)
+        if frame_skip > 1 and iteration % frame_skip != 0:
+            return
         try:
             if self.data_queue.full():
                 # Drop oldest frame if queue is full
@@ -76,7 +65,7 @@ class MetricsWorker(QObject):
                     self.data_queue.get_nowait()
                 except queue.Empty:
                     pass
-            self.data_queue.put((u, v, pressure, mask, iteration), block=False)
+            self.data_queue.put((u, v, pressure, mask, iteration, u_prev, v_prev), block=False)
         except queue.Full:
             pass  # Drop frame if queue is full
 
@@ -93,7 +82,7 @@ class MetricsWorker(QObject):
 
             try:
                 # Get data from queue with timeout
-                u, v, pressure, mask, iteration = self.data_queue.get(timeout=0.1)
+                u, v, pressure, mask, iteration, u_prev, v_prev = self.data_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
@@ -140,9 +129,9 @@ class MetricsWorker(QObject):
                 should_compute_metrics = (iteration % self.solver.metrics_frame_skip == 0) if self.solver.metrics_frame_skip > 1 else True
 
                 # Compute error metrics (only on frames matching frame skip)
-                if self.solver.iteration > 0 and should_compute_metrics:
-                    u_prev_np = np.array(self.solver.u_prev)
-                    v_prev_np = np.array(self.solver.v_prev)
+                if iteration > 0 and should_compute_metrics and u_prev is not None:
+                    u_prev_np = np.array(u_prev)
+                    v_prev_np = np.array(v_prev)
 
                     # For MAC grid, interpolate previous velocities to cell centers (current already interpolated above)
                     if grid_type == 'mac':
@@ -306,6 +295,7 @@ class SimulationWorker(QObject):
     data_ready = pyqtSignal(object)  # Signal when new data is ready
     fps_update = pyqtSignal(int)     # Signal for FPS updates
     profiling_update = pyqtSignal(float, float, float, float)  # Signal for profiling data (solver_ms, interp_ms, total_ms, sim_fps)
+    aoa_changed = pyqtSignal(float)  # Dynamic AoA sweep moved the airfoil; GUI updates its widgets
 
     def __init__(self, solver, control_panel=None, info_panel=None, metrics_worker=None, flow_viz=None):
         super().__init__()
@@ -328,15 +318,31 @@ class SimulationWorker(QObject):
         self.sim_fps_counter = 0
         self.last_sim_fps_time = time.time()
         
-        # Initialize shared memory buffers for zero-copy transfer
-        nx, ny = solver.grid.nx, solver.grid.ny
-        self.shared_buffers = {
-            'u': SharedData((nx, ny), np.float32),
-            'v': SharedData((nx, ny), np.float32),
-            'vort': SharedData((nx, ny), np.float32),
-            'vel_mag': SharedData((nx, ny), np.float32)
+        # Widget values the loop needs. Qt widgets must only be touched on the GUI
+        # thread, so SimulationController refreshes this snapshot on every display refresh
+        # and the worker thread only reads it.
+        self.ui_state = self.read_ui_state()
+        self._frame_pending = False  # A frame is queued for the GUI and not yet consumed
+
+    def read_ui_state(self) -> dict:
+        """Snapshot widget values (GUI thread only)."""
+        cp, ip = self.control_panel, self.info_panel
+        state = {
+            'compute_diagnostics': ip.diagnostics_checkbox.isChecked() if ip else True,
+            'compute_div': bool(self.flow_viz is not None and hasattr(self.flow_viz, 'div_plot')
+                                and self.flow_viz.div_plot.isVisible()),
+            'dynamic_aoa': False,
         }
-        
+        if cp and hasattr(cp, 'dynamic_airfoil_checkbox'):
+            state.update(
+                dynamic_aoa=cp.dynamic_airfoil_checkbox.value() == 1,
+                min_aoa=cp.min_aoa_spinbox.value(),
+                max_aoa=cp.max_aoa_spinbox.value(),
+                aoa_increment=cp.aoa_increment_spinbox.value(),
+                steps_per_increment=cp.steps_per_increment_slider.value(),
+            )
+        return state
+
     def start(self):
         """Start the simulation thread"""
         try:
@@ -382,12 +388,11 @@ class SimulationWorker(QObject):
                 # Run simulation step with coefficient computation for airfoil metrics
                 t_solver_start = time.time()
                 try:
-                    # Get diagnostics setting from GUI
-                    compute_diagnostics = self.info_panel.diagnostics_checkbox.isChecked() if self.info_panel else True
-                    
+                    ui = self.ui_state
+                    compute_diagnostics = ui['compute_diagnostics']
                     # Always pass compute_diagnostics=False to avoid blocking - metrics computed in separate thread
                     # Only compute divergence if the divergence plot is visible
-                    compute_div = hasattr(self, 'flow_viz') and hasattr(self.flow_viz, 'div_plot') and self.flow_viz.div_plot.isVisible()
+                    compute_div = ui['compute_div']
                     u, v, vort, div = self.solver.step_for_visualization(
                         compute_divergence=compute_div,
                         compute_drag_lift=True,
@@ -414,105 +419,119 @@ class SimulationWorker(QObject):
                         self.solver.v,
                         self.solver.current_pressure,
                         self.solver.mask,
-                        self.solver.iteration
+                        self.solver.iteration,
+                        getattr(self.solver, 'u_prev', None),
+                        getattr(self.solver, 'v_prev', None),
                     )
                 
-                # Get divergence from solver history (already computed in JIT step)
-                if hasattr(self.solver, 'history') and 'rms_divergence' in self.solver.history and self.solver.history['rms_divergence']:
-                    div_rms = self.solver.history['rms_divergence'][-1]
+                # Only build (host-copy) and post a display frame once the GUI has consumed the
+                # previous one. Posting every step floods the GUI event queue, which starves
+                # Qt timers on Windows and forces a device->host sync on every step.
+                if self._frame_pending:
+                    # Still wait for the step (no copy) so the loop can't queue unbounded async work
+                    # ahead of pause/parameter changes
+                    jax.block_until_ready(u)
+                    t_interp_start = t_interp_end = t_signal_end = time.time()
                 else:
-                    div_rms = 0.0  # Fallback if not available
-                
-                # Interpolate MAC grid velocities to cell centers for visualization
-                t_interp_start = time.time()
-                grid_type = getattr(self.solver.sim_params, 'grid_type', 'collocated')
-                solver_type = getattr(self.solver.sim_params, 'solver_type', 'navier_stokes')
-                
-                # LBM always uses collocated grid, regardless of grid_type setting
-                if solver_type == 'lattice_boltzmann' or grid_type == 'collocated':
-                    # Collocated grid - use directly (LBM case)
-                    u_display = u
-                    v_display = v
-                    vort_display = vort
-                    try:
-                        vel_mag = jnp.sqrt(u**2 + v**2)
-                    except Exception as vel_error:
-                        logger.error(f"Velocity magnitude calculation failed: {vel_error}")
-                        vel_mag = jnp.zeros_like(u)  # Fallback value
-                    vel_mag_display = vel_mag
-                elif grid_type == 'mac':
-                    # MAC grid with traditional NS solver - interpolate staggered velocities
-                    u_center = 0.5 * (u[1:, :] + u[:-1, :])
-                    v_center = 0.5 * (v[:, 1:] + v[:, :-1])
-                    u_display = u_center
-                    v_display = v_center
-                    # Compute velocity magnitude from interpolated velocities
-                    vel_mag = jnp.sqrt(u_center**2 + v_center**2)
-                    vel_mag_display = vel_mag
-                    # Interpolate vorticity to cell centers if needed
-                    if vort.shape == (self.solver.grid.nx + 1, self.solver.grid.ny):
-                        vort_display = 0.5 * (vort[1:, :] + vort[:-1, :])
-                    elif vort.shape == (self.solver.grid.nx, self.solver.grid.ny + 1):
-                        vort_display = 0.5 * (vort[:, 1:] + vort[:, :-1])
+                    # Get divergence from solver history (already computed in JIT step)
+                    if hasattr(self.solver, 'history') and 'rms_divergence' in self.solver.history and self.solver.history['rms_divergence']:
+                        div_rms = self.solver.history['rms_divergence'][-1]
                     else:
+                        div_rms = 0.0  # Fallback if not available
+                
+                    # Interpolate MAC grid velocities to cell centers for visualization
+                    t_interp_start = time.time()
+                    grid_type = getattr(self.solver.sim_params, 'grid_type', 'collocated')
+                    solver_type = getattr(self.solver.sim_params, 'solver_type', 'navier_stokes')
+                
+                    # LBM always uses collocated grid, regardless of grid_type setting
+                    if solver_type == 'lattice_boltzmann' or grid_type == 'collocated':
+                        # Collocated grid - use directly (LBM case)
+                        u_display = u
+                        v_display = v
                         vort_display = vort
-                else:
-                    # Default to collocated treatment
-                    u_display = u
-                    v_display = v
-                    vort_display = vort
-                    try:
-                        vel_mag = jnp.sqrt(u**2 + v**2)
-                    except Exception as vel_error:
-                        logger.error(f"Velocity magnitude calculation failed: {vel_error}")
-                        vel_mag = jnp.zeros_like(u)  # Fallback value
-                    vel_mag_display = vel_mag
-                t_interp_end = time.time()
+                        try:
+                            vel_mag = jnp.sqrt(u**2 + v**2)
+                        except Exception as vel_error:
+                            logger.error(f"Velocity magnitude calculation failed: {vel_error}")
+                            vel_mag = jnp.zeros_like(u)  # Fallback value
+                        vel_mag_display = vel_mag
+                    elif grid_type == 'mac':
+                        # MAC grid with traditional NS solver - interpolate staggered velocities
+                        u_center = 0.5 * (u[1:, :] + u[:-1, :])
+                        v_center = 0.5 * (v[:, 1:] + v[:, :-1])
+                        u_display = u_center
+                        v_display = v_center
+                        # Compute velocity magnitude from interpolated velocities
+                        vel_mag = jnp.sqrt(u_center**2 + v_center**2)
+                        vel_mag_display = vel_mag
+                        # Interpolate vorticity to cell centers if needed
+                        if vort.shape == (self.solver.grid.nx + 1, self.solver.grid.ny):
+                            vort_display = 0.5 * (vort[1:, :] + vort[:-1, :])
+                        elif vort.shape == (self.solver.grid.nx, self.solver.grid.ny + 1):
+                            vort_display = 0.5 * (vort[:, 1:] + vort[:, :-1])
+                        else:
+                            vort_display = vort
+                    else:
+                        # Default to collocated treatment
+                        u_display = u
+                        v_display = v
+                        vort_display = vort
+                        try:
+                            vel_mag = jnp.sqrt(u**2 + v**2)
+                        except Exception as vel_error:
+                            logger.error(f"Velocity magnitude calculation failed: {vel_error}")
+                            vel_mag = jnp.zeros_like(u)  # Fallback value
+                        vel_mag_display = vel_mag
+                    t_interp_end = time.time()
                 
-                # Create metadata dict with arrays directly
-                t_queue_start = time.time()
-                scalar_field = None
-                if hasattr(self.solver, 'lbm_params') and getattr(self.solver.lbm_params, 'enable_thermal', False):
-                    scalar_field = np.asarray(self.solver.T, dtype=np.float32) if hasattr(self.solver, 'T') else None
-                else:
-                    scalar_field = np.asarray(self.solver.c, dtype=np.float32) if hasattr(self.solver, 'c') else None
+                    # Create metadata dict with arrays directly
+                    t_queue_start = time.time()
+                    scalar_field = None
+                    pressure = getattr(self.solver, 'current_pressure', None)
+                    if hasattr(self.solver, 'lbm_params') and getattr(self.solver.lbm_params, 'enable_thermal', False):
+                        scalar_field = np.asarray(self.solver.T, dtype=np.float32) if hasattr(self.solver, 'T') else None
+                    else:
+                        scalar_field = np.asarray(self.solver.c, dtype=np.float32) if hasattr(self.solver, 'c') else None
 
-                data = {
-                    'time': self.solver.iteration * self.solver.dt,
-                    'iteration': self.solver.iteration,
-                    'rms_divergence': div_rms,
-                    'u': np.asarray(u_display, dtype=np.float32),
-                    'v': np.asarray(v_display, dtype=np.float32),
-                    'vort': np.asarray(vort_display, dtype=np.float32),
-                    'vel_mag': np.asarray(vel_mag_display, dtype=np.float32),
-                    'div': np.asarray(div, dtype=np.float32) if div is not None else None,
-                    'scalar': scalar_field,
-                }
-                t_queue_end = time.time()
+                    data = {
+                        'time': self.solver.iteration * self.solver.dt,
+                        'iteration': self.solver.iteration,
+                        'rms_divergence': div_rms,
+                        'u': np.asarray(u_display, dtype=np.float32),
+                        'v': np.asarray(v_display, dtype=np.float32),
+                        'vort': np.asarray(vort_display, dtype=np.float32),
+                        'vel_mag': np.asarray(vel_mag_display, dtype=np.float32),
+                        'div': np.asarray(div, dtype=np.float32) if div is not None else None,
+                        'scalar': scalar_field,
+                        'pressure': np.asarray(pressure, dtype=np.float32) if pressure is not None else None,
+                    }
+                    t_queue_end = time.time()
                 
-                # Emit signal for UI update (every iteration for smooth visualization)
-                t_signal_start = time.time()
-                if self.running:
-                    try:
-                        self.data_ready.emit(data)
-                    except Exception as emit_error:
-                        logger.error(f"Signal emission failed: {emit_error}")
-                        import traceback
-                        traceback.print_exc()
-                t_signal_end = time.time()
-                
+                    # Emit signal for UI update (every iteration for smooth visualization)
+                    t_signal_start = time.time()
+                    if self.running:
+                        try:
+                            self._frame_pending = True
+                            self.data_ready.emit(data)
+                        except Exception as emit_error:
+                            self._frame_pending = False
+                            logger.error(f"Signal emission failed: {emit_error}")
+                            import traceback
+                            traceback.print_exc()
+                    t_signal_end = time.time()
+
                 # Dynamic airfoil motion logic
-                if self.control_panel and hasattr(self.control_panel, 'dynamic_airfoil_checkbox'):
+                if 'min_aoa' in ui:
                     # Check if dynamic mode is enabled and obstacle is NACA
-                    is_dynamic = self.control_panel.dynamic_airfoil_checkbox.value() == 1
+                    is_dynamic = ui['dynamic_aoa']
                     is_naca = getattr(self.solver.sim_params, 'obstacle_type', '') == 'naca_airfoil'
 
                     if is_dynamic and is_naca:
-                        # Get parameters from UI
-                        min_aoa = self.control_panel.min_aoa_spinbox.value()
-                        max_aoa = self.control_panel.max_aoa_spinbox.value()
-                        aoa_increment = self.control_panel.aoa_increment_spinbox.value()
-                        steps_per_increment = self.control_panel.steps_per_increment_slider.value()
+                        min_aoa = ui['min_aoa']
+                        max_aoa = ui['max_aoa']
+                        aoa_increment = ui['aoa_increment']
+                        steps_per_increment = ui['steps_per_increment']
 
                         # Initialize on first iteration
                         if not dynamic_aoa_enabled:
@@ -544,26 +563,9 @@ class SimulationWorker(QObject):
 
                             # Update solver with new AoA
                             if hasattr(self.solver, 'update_naca_angle'):
+                                # Mask/SDF are traced step inputs, so no recompile is needed
                                 self.solver.update_naca_angle(dynamic_aoa_current, recompute=True)
-
-                                # Clear JIT cache and recompile to pick up new mask
-                                import jax
-                                jax.clear_caches()
-                                if hasattr(self.solver, '_jit_cache'):
-                                    self.solver._jit_cache.clear()
-                                if hasattr(self.solver, '_step_jit'):
-                                    delattr(self.solver, '_step_jit')
-                                self.solver._step_jit = self.solver.get_step_jit()
-
-                                # Update UI spinbox to reflect current AoA
-                                if hasattr(self.control_panel, 'angle_spinbox'):
-                                    self.control_panel.angle_spinbox.blockSignals(True)
-                                    self.control_panel.angle_spinbox.setValue(dynamic_aoa_current)
-                                    self.control_panel.angle_spinbox.blockSignals(False)
-                                if hasattr(self.control_panel, 'angle_slider'):
-                                    self.control_panel.angle_slider.blockSignals(True)
-                                    self.control_panel.angle_slider.setValue(int(dynamic_aoa_current * 10))
-                                    self.control_panel.angle_slider.blockSignals(False)
+                                self.aoa_changed.emit(dynamic_aoa_current)
                     else:
                         # Dynamic mode disabled, reset state
                         dynamic_aoa_enabled = False
@@ -606,21 +608,6 @@ class SimulationWorker(QObject):
         """Resume the simulation"""
         self.paused = False
 
-    def recreate_shared_buffers(self, new_nx, new_ny):
-        """Recreate shared memory buffers for new grid dimensions"""
-        # Clean up old buffers
-        if hasattr(self, 'shared_buffers'):
-            for buffer in self.shared_buffers.values():
-                buffer.cleanup()
-        
-        # Create new buffers with updated dimensions
-        self.shared_buffers = {
-            'u': SharedData((new_nx, new_ny), np.float32),
-            'v': SharedData((new_nx, new_ny), np.float32),
-            'vort': SharedData((new_nx, new_ny), np.float32),
-            'vel_mag': SharedData((new_nx, new_ny), np.float32)
-        }
-
     def stop_simulation(self):
         """Stop the simulation thread with robust cleanup"""
         self.running = False
@@ -633,14 +620,6 @@ class SimulationWorker(QObject):
                 logger.warning("Simulation thread did not stop gracefully after 5 seconds")
                 # Thread is still alive - this shouldn't happen but we'll continue anyway
 
-        # Clean up shared memory
-        if hasattr(self, 'shared_buffers'):
-            for buffer in self.shared_buffers.values():
-                try:
-                    buffer.cleanup()
-                except Exception as e:
-                    logger.warning(f"Buffer cleanup error: {e}")
-    
     def pause_simulation(self):
         """Pause the simulation without stopping the thread"""
         self.paused = True
@@ -676,31 +655,40 @@ class SimulationController:
         self.frame_counter = 0
         self.fps_counter = 0
         self.last_fps_time = time.time()
+
+    def refresh_worker_ui_state(self):
+        """Re-snapshot widget values for the worker (GUI thread; called once per display refresh)."""
+        if self.simulation_worker is not None:
+            try:
+                self.simulation_worker.ui_state = self.simulation_worker.read_ui_state()
+            except RuntimeError:
+                pass  # Widget deleted during shutdown
+
+    def _on_dynamic_aoa_changed(self, angle: float):
+        """Mirror the sweep's current AoA into the angle widgets (GUI thread)."""
+        cp = self.control_panel
+        if hasattr(cp, 'angle_spinbox'):
+            cp.angle_spinbox.blockSignals(True)
+            cp.angle_spinbox.setValue(angle)
+            cp.angle_spinbox.blockSignals(False)
+        if hasattr(cp, 'angle_slider'):
+            cp.angle_slider.blockSignals(True)
+            cp.angle_slider.setValue(int(angle * 10))
+            cp.angle_slider.blockSignals(False)
         
     def update_grid_size(self, new_nx, new_ny):
         """Update simulation worker for new grid size - COMPLETE RESTART"""
         # Force complete shutdown
         self.stop_simulation()
         
-        # Clear all references to force garbage collection
-        if self.simulation_worker:
-            try:
-                if hasattr(self.simulation_worker, 'shared_buffers'):
-                    for buffer in self.simulation_worker.shared_buffers.values():
-                        buffer.cleanup()
-            except Exception as cleanup_error:
-                logger.warning(f"Buffer cleanup error: {cleanup_error}")
-            finally:
-                self.simulation_worker = None
-        
+        self.simulation_worker = None
+
         # Clear latest data to prevent stale references
         self.latest_data = None
         
         # Force garbage collection
         import gc
         gc.collect()
-        import jax
-        jax.clear_caches()
 
     def start_simulation(self, callbacks):
         """Start simulation in separate thread"""
@@ -747,9 +735,14 @@ class SimulationController:
 
             # Connect signals
             if 'data_ready' in callbacks:
-                self.simulation_worker.data_ready.connect(
-                    callbacks['data_ready'], Qt.ConnectionType.QueuedConnection
-                )
+                worker = self.simulation_worker
+                deliver = callbacks['data_ready']
+
+                def on_frame(data, worker=worker, deliver=deliver):
+                    worker._frame_pending = False  # GUI took the frame; worker may publish the next
+                    deliver(data)
+
+                worker.data_ready.connect(on_frame, Qt.ConnectionType.QueuedConnection)
             if 'fps_update' in callbacks:
                 self.simulation_worker.fps_update.connect(
                     callbacks['fps_update'], Qt.ConnectionType.QueuedConnection
@@ -762,6 +755,10 @@ class SimulationController:
                 self.metrics_worker.metrics_ready.connect(
                     callbacks['metrics_ready'], Qt.ConnectionType.QueuedConnection
                 )
+
+            self.simulation_worker.aoa_changed.connect(
+                self._on_dynamic_aoa_changed, Qt.ConnectionType.QueuedConnection
+            )
 
             # Start the thread
             self.simulation_worker.start()
@@ -792,10 +789,6 @@ class SimulationController:
         # Force garbage collection
         import gc
         gc.collect()
-
-        # Clear JAX caches
-        import jax
-        jax.clear_caches()
 
     def start_metrics(self):
         """Start metrics worker"""
