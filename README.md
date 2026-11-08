@@ -40,18 +40,32 @@ The framework is CPU‑optimised for real-time performance. Typical performance 
 ```bash
 git clone https://github.com/arriemeijer-creator/AeroJAX
 cd AeroJAX
-pip install -r requirements.txt
+python -m venv .venv
+# Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
+python -m pip install -r requirements.txt
 python main.py
 ```
 ### Requirements
 
-Python 3.11+
+Python 3.11+ (tested on 3.14)
 
 > Optional NVIDIA Hardware Acceleration
 > ```bash
 >python -m pip install --upgrade "jax[cuda12]" #For CUDA 12
 >python -m pip install --upgrade "jax[cuda13]" #For CUDA 13
 >```
+> AeroJAX runs on the CPU by default; set `AEROJAX_PLATFORM=cuda` to use the GPU.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `AEROJAX_PLATFORM` | `cpu` | JAX platform(s), e.g. `cuda` |
+| `AEROJAX_PRECISION` | saved setting / `float32` | `float32` or `float64` (normally set from the Precision panel) |
+| `AEROJAX_CACHE_DIR` | `%LOCALAPPDATA%\AeroJAX\jax_cache` (`~/.cache/...` elsewhere) | Persistent XLA compilation cache; empty string disables it |
+
+Compiled solver steps are cached on disk, so restarts and switching back to a previously used solver/grid configuration skip most compilation.
+
 ## The GUI
 
 <div align="center">
@@ -65,6 +79,19 @@ Python 3.11+
 - Start with 512×96 grid for real‑time performance.
 - Try the default initialized von Kármán with NACA 0012 airfoil at 10° AoA.
 - Enable "Adaptive dt" to see the PID controller in action.
+
+### Keyboard shortcuts
+
+| Keys | Action |
+|------|--------|
+| Space | Start / pause |
+| Ctrl+Shift+R | Reset simulation |
+| Ctrl+S / Ctrl+O | Save / load simulation state |
+| Ctrl+F | Auto-scale all plots |
+| Ctrl+R | Reset plot view |
+| F11 | Toggle fullscreen |
+
+Theme, colormaps, window layout and precision are remembered between sessions.
 
 ## What you can control
 
@@ -93,7 +120,7 @@ A semi-transparent overlay provides instant access to the most frequent interact
 | Grid Size | Nx, Ny (64‑4096 / 32‑2048) - requires sim restart |
 | Grid Type | Collocated or MAC (staggered) - sim restart |
 | Solver Type | Navier‑Stokes or Lattice Boltzmann (D2Q9/D2Q7) - enables direct solver-to-solver comparison under identical flow conditions - sim restart required |
-| Precision | float32 / float64 - GUI reload |
+| Precision | float32 / float64 - saved and applied after an automatic restart |
 
 ### Flow parameters
 
@@ -110,7 +137,7 @@ A semi-transparent overlay provides instant access to the most frequent interact
 | Hyper ν | Hyperviscosity (0‑0.05) - improves stability for under‑resolved turbulence. |
 | Fast Mode (RK2) | Switches from RK3 to RK2 - faster but less accurate. |
 | LES | Enable, choose Smagorinsky or dynamic Smagorinsky. Apply live. |
-| Pressure Solver | Multigrid, CG (iteration-dependent; slower for poorly conditioned systems), FFT (for periodic BCs like LDC), Jacobi - requires sim restart. |
+| Pressure Solver | Multigrid, CG (iteration-dependent; slower for poorly conditioned systems), FFT (for periodic BCs like LDC), Jacobi - Apply live. |
 
 ### Boundary conditions
 
@@ -243,8 +270,8 @@ This aligns with the broader goal:
 ## Export & recording
 
 - Export Frame - save current visualisation as PNG.
-- Record - toggle video recording (saves to disk).
-- Save State - not yet implemented.
+- Record - toggle video recording; Save Video writes an .mp4 (via imageio-ffmpeg).
+- Save State / Load State - save the full solver state (fields, parameters, metric history) to a `.pkl` file and restore it later (same solver type and grid size). State files are Python pickles: only load files you created.
 
 ## Numerical methods & Solver details
 
