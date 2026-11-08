@@ -10,6 +10,10 @@ import warnings
 import os
 import logging
 from typing import Optional, Dict, Any
+
+# Precision must be chosen before JAX is configured (solver.config reads this on import)
+from viewer.settings import saved_precision
+os.environ.setdefault('AEROJAX_PRECISION', saved_precision())
 import numpy as np
 import jax.numpy as jnp
 import jax
@@ -461,7 +465,9 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
         self.control_panel.export_btn.clicked.connect(self.export_simulation_data)
         self.control_panel.record_btn.clicked.connect(self.toggle_video_recording)
         self.control_panel.save_btn.clicked.connect(self.save_recorded_video)
-        
+        self.control_panel.save_state_btn.clicked.connect(self.save_state_dialog)
+        self.control_panel.load_state_btn.clicked.connect(self.load_state_dialog)
+
         # Auto-scaling
         self.control_panel.autofit_velocity_btn.clicked.connect(self.auto_scale_velocity_plot)
         self.control_panel.autofit_vorticity_btn.clicked.connect(self.auto_scale_vorticity_plot)
@@ -577,17 +583,92 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
     
     def _setup_keyboard_shortcuts(self) -> None:
         """Configure keyboard shortcuts for common actions."""
+        from PyQt6.QtGui import QKeySequence, QShortcut
+
+        shortcuts = {
+            "Ctrl+F": self.auto_scale_all_plots,
+            "Ctrl+R": self.reset_plot_view,
+            "Space": self.toggle_start_pause,
+            "Ctrl+Shift+R": self.reset_simulation,
+            "Ctrl+S": self.save_state_dialog,
+            "Ctrl+O": self.load_state_dialog,
+            "F11": self.toggle_fullscreen,
+        }
+        for keys, handler in shortcuts.items():
+            shortcut = QShortcut(QKeySequence(keys), self)
+            # Window-wide, so Space works without first clicking the plot area
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(handler)
+
+    def is_simulation_running(self) -> bool:
+        """True while the simulation worker is actively stepping (not paused or stopped)."""
+        worker = self.sim_controller.simulation_worker
+        return (worker is not None and worker.running and not worker.paused
+                and worker.thread is not None and worker.thread.is_alive())
+
+    def toggle_start_pause(self) -> None:
+        """Start the simulation if stopped/paused, otherwise pause it."""
+        if self.is_simulation_running():
+            self.pause_simulation()
+        else:
+            self.start_simulation()
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showMaximized()
+        else:
+            self.showFullScreen()
+
+    def save_state_dialog(self) -> None:
+        """Save the solver state (fields, parameters, history) to a file."""
+        from PyQt6.QtWidgets import QFileDialog
+        from solver.state_io import StateIO
+
+        path, _ = QFileDialog.getSaveFileName(self, "Save Simulation State", "aerojax_state.pkl",
+                                              "AeroJAX state (*.pkl)")
+        if not path:
+            return
+        was_running = self.is_simulation_running()
+        if was_running:
+            self.pause_simulation()
         try:
-            from PyQt6.QtWidgets import QShortcut
-            from PyQt6.QtGui import QKeySequence
-            
-            shortcut_auto_fit = QShortcut(QKeySequence("Ctrl+F"), self)
-            shortcut_auto_fit.activated.connect(self.auto_scale_both_plots)
-            
-            shortcut_reset_ranges = QShortcut(QKeySequence("Ctrl+R"), self)
-            shortcut_reset_ranges.activated.connect(self.reset_plot_view)
-        except ImportError:
-            print("Keyboard shortcuts not available")
+            StateIO.save_state(self.solver, path)
+            self.statusBar().showMessage(f"State saved to {path}", 5000)
+        except Exception as e:
+            logger.exception("Saving state failed")
+            QMessageBox.warning(self, "Save State", f"Could not save state:\n{e}")
+        finally:
+            if was_running:
+                self.start_simulation()
+
+    def load_state_dialog(self) -> None:
+        """Load a saved state into the current solver (same solver type and grid size)."""
+        from PyQt6.QtWidgets import QFileDialog
+        from solver.state_io import StateIO
+
+        path, _ = QFileDialog.getOpenFileName(self, "Load Simulation State", "",
+                                              "AeroJAX state (*.pkl)")
+        if not path:
+            return
+        try:
+            # Note: state files are pickles; only load files you created
+            state = StateIO.load_state(path)
+            grid = state['grid_params']
+            if (grid['nx'], grid['ny']) != (self.solver.grid.nx, self.solver.grid.ny):
+                QMessageBox.information(
+                    self, "Load State",
+                    f"This state uses a {grid['nx']}x{grid['ny']} grid. Switch the grid size to match "
+                    f"(currently {self.solver.grid.nx}x{self.solver.grid.ny}) and load it again.")
+                return
+            if self.is_simulation_running():
+                self.pause_simulation()
+            StateIO.restore_solver(self.solver, state)
+            if self.obstacle_renderer is not None:
+                self.obstacle_renderer.update_obstacle_outlines(self.solver)
+            self.statusBar().showMessage(f"State loaded from {path} — press Start (Space) to continue", 8000)
+        except Exception as e:
+            logger.exception("Loading state failed")
+            QMessageBox.warning(self, "Load State", f"Could not load state:\n{e}")
     
     def _load_initial_state(self) -> None:
         """Load the initial simulation state and configure UI."""
@@ -664,7 +745,6 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
         
         # Force adaptive_dt=False in solver params and recompile JIT
         self.solver.sim_params.adaptive_dt = False
-        jax.clear_caches()
         self.solver._step_jit = self.solver.get_step_jit()
         print(f"Forced adaptive_dt=False and recompiled _step_jit")
         
@@ -748,8 +828,11 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
     def start_simulation(self) -> None:
         """Begin or resume the fluid simulation."""
         try:
-            # If we're paused, just resume
-            if self.is_paused:
+            # If we're paused with a live worker, just resume. Solver/grid/flow changes stop the
+            # worker, so a "paused" flag alone does not mean there is anything to resume.
+            worker = self.sim_controller.simulation_worker
+            worker_alive = worker is not None and worker.thread is not None and worker.thread.is_alive()
+            if self.is_paused and worker_alive:
                 self.sim_controller.resume_simulation()
                 self.is_paused = False
             else:
@@ -760,6 +843,7 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
                     'profiling_update': self.handle_profiling_update,
                     'metrics_ready': self.handle_metrics_data
                 })
+                self.is_paused = False
 
             self.on_simulation_started()  # Lock x-position slider
             self.control_panel.start_btn.setEnabled(False)
@@ -1776,7 +1860,6 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
         # Recompile solver with new pressure solver
         if hasattr(self.solver, '_step_jit'):
             import jax
-            jax.clear_caches()
             self.solver._step_jit = self.solver.get_step_jit()
             print("Solver recompiled with new pressure solver")
 
@@ -1819,7 +1902,6 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
             
             # Clear JAX cache to recompile with new fast_mode setting
             import jax
-            jax.clear_caches()
             
             # Clear JIT cache to force recompilation with new fast_mode
             if hasattr(self.solver, '_jit_cache'):
@@ -1990,11 +2072,21 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
 
     def refresh_display(self) -> None:
         """Override to add snapshot recording."""
+        t_start = time.perf_counter()
+        self.sim_controller.refresh_worker_ui_state()
         # Call parent method to update display
         super().refresh_display()
-        
+
         # Record snapshot if enabled
         self.record_snapshot_if_enabled()
+
+        # Re-arm the timer from now. When a refresh takes longer than the frame interval
+        # (large grids, overlays), a fixed-period timer is always overdue and starves every
+        # other timer and input event; this keeps a small idle gap after each refresh.
+        if self.refresh_timer.isActive():
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            target_ms = 1000 / self.config.viz_config.target_vis_fps
+            self.refresh_timer.start(int(max(target_ms - elapsed_ms, 5)))
     
     def change_upscale_factor(self, value: int) -> None:
         """Change the visualization upscale factor for smooth rendering"""
@@ -2216,9 +2308,41 @@ class BaselineViewerRefactored(QMainWindow, ParameterHandlers, DisplayManager, F
     # Cleanup
     # -------------------------------------------------------------------------
     
+    def _restore_user_settings(self) -> None:
+        """Apply persisted UI preferences (theme, colormaps, window geometry, precision)."""
+        from viewer.settings import app_settings, THEME_DARK_KEY, COLORMAP_KEYS, GEOMETRY_KEY
+        settings = app_settings()
+        if settings.value(THEME_DARK_KEY, False, type=bool) != self.is_dark_theme:
+            self.toggle_theme()
+        for combo_name, key in COLORMAP_KEYS.items():
+            combo = getattr(self.control_panel, combo_name, None)
+            value = settings.value(key)
+            if combo is not None and value and combo.findText(value) >= 0:
+                combo.setCurrentText(value)
+        geometry = settings.value(GEOMETRY_KEY)
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        self.control_panel.precision_combo.blockSignals(True)
+        self.control_panel.precision_combo.setCurrentText(os.environ.get('AEROJAX_PRECISION', 'float32'))
+        self.control_panel.precision_combo.blockSignals(False)
+
+    def _save_user_settings(self) -> None:
+        from viewer.settings import app_settings, THEME_DARK_KEY, COLORMAP_KEYS, GEOMETRY_KEY
+        settings = app_settings()
+        settings.setValue(THEME_DARK_KEY, self.is_dark_theme)
+        for combo_name, key in COLORMAP_KEYS.items():
+            combo = getattr(self.control_panel, combo_name, None)
+            if combo is not None:
+                settings.setValue(key, combo.currentText())
+        settings.setValue(GEOMETRY_KEY, self.saveGeometry())
+
     def closeEvent(self, event) -> None:
         """Clean up resources when closing the application."""
         print("Cleaning up application...")
+        try:
+            self._save_user_settings()
+        except Exception:
+            logger.exception("Saving user settings failed")
         
         self.sim_controller.stop_simulation()
         self.refresh_timer.stop()
@@ -2263,12 +2387,18 @@ def main() -> None:
         app.processEvents()  # Force splash to render immediately
         
         # Now do all the heavy initialization while splash is visible
-        # Add global exception handler
+        main_window = []  # Filled once the viewer exists, so the hook can surface errors in the UI
+
         def handle_exception(exc_type, exc_value, exc_traceback):
-            print(f"CRITICAL ERROR: {exc_type.__name__}: {exc_value}")
-            print("Attempting to continue simulation...")
-            # Don't crash - just report and continue
-        
+            """Log unhandled exceptions with full traceback and keep the app running."""
+            if issubclass(exc_type, KeyboardInterrupt):
+                sys.__excepthook__(exc_type, exc_value, exc_traceback)
+                return
+            logger.error("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+            if main_window:
+                main_window[0].statusBar().showMessage(
+                    f"Error: {exc_type.__name__}: {exc_value} (details in aerojax.log)", 15000)
+
         sys.excepthook = handle_exception
         
         # Load configuration (this can be slow)
@@ -2316,24 +2446,11 @@ def main() -> None:
         splash.update_progress(70, "Initializing solver...")
         app.processEvents()
 
-        # Clear JAX caches to force recompilation with updated code
-        jax.clear_caches()
 
         solver = BaselineSolver(
             grid, flow, geometry, simulation_params,
             dt=config.sim_config.default_dt
         )
-        
-        # Force adaptive_dt=False and recompile JIT to prevent dt mismatch
-        try:
-            solver.sim_params.adaptive_dt = False
-            jax.clear_caches()
-            solver._step_jit = solver.get_step_jit()
-            print(f"Forced adaptive_dt=False and recompiled _step_jit")
-        except Exception as e:
-            print(f"ERROR forcing adaptive_dt=False: {e}")
-            import traceback
-            traceback.print_exc()
         
         # Display simulation details
         X, Y = solver.grid.X, solver.grid.Y
@@ -2348,17 +2465,12 @@ def main() -> None:
         splash.update_progress(90, "Building user interface...")
         app.processEvents()
         viewer = BaselineViewerRefactored(solver, config)
+        main_window.append(viewer)
         viewer.showMaximized()
+        viewer._restore_user_settings()
         splash.update_progress(100, "Complete!")
         app.processEvents()
         splash.close()  # Close the splash screen
-        
-        # Add global exception handler
-        def handle_exception(exc_type, exc_value, exc_traceback):
-            print(f"Unhandled exception: {exc_type.__name__}: {exc_value}")
-            print("Application continuing despite exception...")
-        
-        sys.excepthook = handle_exception
         
         sys.exit(app.exec())
         

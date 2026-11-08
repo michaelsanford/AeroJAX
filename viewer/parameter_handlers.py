@@ -202,53 +202,34 @@ class ParameterHandlers:
         pass
     
     def update_precision(self) -> None:
-        """Update JAX precision setting and restart application."""
+        """Persist the chosen precision and restart the app so JAX picks it up."""
+        import os
+        import sys
+        from PyQt6.QtCore import QProcess
+        from PyQt6.QtWidgets import QMessageBox
+        from viewer.settings import app_settings, PRECISION_KEY
+
         precision = self.control_panel.precision_combo.currentText()
-        
-        # Map precision to JAX config
-        enable_x64 = (precision == "float64")
-        
-        # Modify the JAX config in solver/config.py
-        try:
-            import os
-            import sys
-            config_file = os.path.join(os.path.dirname(__file__), "..", "solver", "config.py")
-            
-            # Read the file with UTF-8 encoding
-            with open(config_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Replace the jax_enable_x64 line (handle both True/False cases)
-            import re
-            pattern = r"jax\.config\.update\('jax_enable_x64', (True|False)\)"
-            new_config = f"jax.config.update('jax_enable_x64', {enable_x64})"
-            
-            if re.search(pattern, content):
-                content = re.sub(pattern, new_config, content)
-                
-                # Write back with UTF-8 encoding
-                with open(config_file, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                
-                logger.info(f"Precision changed to {precision}")
-                logger.info("JAX config updated")
-                logger.info("Restarting application...")
-                
-                # Clean up and restart
-                self.close()
-                
-                # Restart the application
-                import subprocess
-                subprocess.Popen([sys.executable] + sys.argv)
-                
-            else:
-                logger.warning(f"Could not find JAX config line in {config_file}")
-                logger.warning("Please manually change: jax.config.update('jax_enable_x64', {enable_x64})")
-                
-        except Exception as e:
-            logger.error(f"Error updating precision: {e}")
-            logger.error("Please manually change in solver/config.py:")
-            logger.error(f"  jax.config.update('jax_enable_x64', {enable_x64})")
+        if precision == os.environ.get('AEROJAX_PRECISION', 'float32'):
+            self.statusBar().showMessage(f"Already running in {precision}", 4000)
+            return
+
+        answer = QMessageBox.question(
+            self, "Change Precision",
+            f"Switching to {precision} requires restarting AeroJAX. "
+            "The current simulation will be lost.\n\nRestart now?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        app_settings().setValue(PRECISION_KEY, precision)
+        logger.info(f"Precision changed to {precision}; restarting")
+        os.environ['AEROJAX_PRECISION'] = precision  # Inherited by the new process
+        started, _pid = QProcess.startDetached(sys.executable, sys.argv, os.getcwd())
+        if started:
+            self.close()
+        else:
+            QMessageBox.warning(self, "Change Precision",
+                                f"Saved {precision}; restart AeroJAX manually to apply it.")
     
     def update_grid_type(self) -> None:
         """Change the grid type between collocated and MAC staggered."""
@@ -265,8 +246,6 @@ class ParameterHandlers:
         self.sim_controller.stop_simulation()
         
         try:
-            # Clear ALL JAX caches before grid type change
-            jax.clear_caches()
             
             # Clear existing JIT compilations
             if hasattr(self.solver, '_step_jit'):
@@ -450,8 +429,6 @@ class ParameterHandlers:
         self.sim_controller.stop_simulation()
         
         try:
-            # Clear ALL JAX caches before grid change
-            jax.clear_caches()
 
             # Re-import multigrid solver to force recompilation with new grid dimensions
             import importlib
@@ -672,7 +649,6 @@ class ParameterHandlers:
                 
                 # Clear everything
                 gc.collect()
-                jax.clear_caches()
                 
                 # Reset simulation to very basic state
                 self.solver.iteration = 0
@@ -731,18 +707,12 @@ class ParameterHandlers:
             old_radius = float(self.solver.geom.radius.item()) if hasattr(self.solver.geom.radius, 'item') else float(self.solver.geom.radius)
             self.solver.geom.radius = jnp.array(new_radius)  # Store as 0D array
             
-            # Clear JAX caches before recompiling with new geometry
-            jax.clear_caches()
             
             # Recompute mask with new radius
             self.solver.mask = self.solver._compute_mask()
             
             # Recompile solver (handle different solver types)
-            if hasattr(self.solver, '_step'):
-                # Baseline solver
-                self.solver._step_jit = jax.jit(self.solver._step)
-            elif hasattr(self.solver, 'get_step_jit'):
-                # LBM solver
+            if hasattr(self.solver, 'get_step_jit'):
                 self.solver._step_jit = self.solver.get_step_jit()
             else:
                 print("Warning: Unknown solver type, skipping recompilation")
@@ -827,8 +797,6 @@ class ParameterHandlers:
             else:
                 self.solver.sim_params.cylinder_spacing = new_spacing
             
-            # Clear JAX caches before recompiling with new geometry
-            jax.clear_caches()
             
             # Recompute mask with new parameters
             self.solver.mask = self.solver._compute_mask()
@@ -886,8 +854,6 @@ class ParameterHandlers:
             # Force adaptive_dt=False to prevent dt mismatch
             self.solver.sim_params.adaptive_dt = False
 
-            # Clear JAX caches
-            jax.clear_caches()
 
             # Recompile solver
             self.solver._step_jit = self.solver.get_step_jit()
@@ -995,7 +961,6 @@ class ParameterHandlers:
             if hasattr(self.solver, '_step_jit'):
                 delattr(self.solver, '_step_jit')
 
-            jax.clear_caches()
 
             # Recompile step function with new LES settings using get_step_jit
             self.solver._step_jit = self.solver.get_step_jit()
@@ -1062,7 +1027,6 @@ class ParameterHandlers:
             if hasattr(self.solver, '_step_jit'):
                 delattr(self.solver, '_step_jit')
 
-            jax.clear_caches()
 
             # Recompile step function with new pressure solver
             self.solver._step_jit = self.solver.get_step_jit()
@@ -1106,7 +1070,6 @@ class ParameterHandlers:
         
         # Clear JIT cache since this affects the pressure solver
         import jax
-        jax.clear_caches()
         if hasattr(self.solver, '_jit_cache'):
             self.solver._jit_cache.clear()
         if hasattr(self.solver, '_step_jit'):
@@ -1125,8 +1088,6 @@ class ParameterHandlers:
         try:
             new_dt = self.control_panel.dt_spinbox.value()
             
-            # Clear ALL JAX caches before changing timestep
-            jax.clear_caches()
             
             # Clear any existing JIT compilations
             if hasattr(self.solver, '_step_jit'):
@@ -1310,8 +1271,6 @@ class ParameterHandlers:
                 except RuntimeError:
                     pass
             
-            # Clear JAX caches
-            jax.clear_caches()
             gc.collect()
             
             # Synchronize Tau slider if switching to LBM
@@ -1335,6 +1294,8 @@ class ParameterHandlers:
         # This prevents background simulation when changing solver type
         self.control_panel.start_btn.setEnabled(True)
         self.control_panel.pause_btn.setEnabled(False)
+        label = 'Lattice Boltzmann' if solver_type == 'lattice_boltzmann' else 'Navier-Stokes'
+        self.statusBar().showMessage(f"Switched to {label} solver — press Start (Space) to run", 8000)
     
     def update_tau_value(self) -> None:
         """Update LBM Tau parameter during simulation."""
