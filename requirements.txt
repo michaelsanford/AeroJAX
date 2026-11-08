@@ -1,23 +1,33 @@
 # Python Dependencies
 
-# Install with: pip install -r requirements.txt
+# Install into a virtual environment:
+#   python -m venv .venv
+#   .venv\Scripts\python -m pip install -r requirements.txt   (Windows)
+#   .venv/bin/python -m pip install -r requirements.txt       (Linux/macOS)
 
-# Core JAX dependencies
-jax>=0.9.0
-jaxlib>=0.9.0
+# Core JAX dependencies (upper bound: JAX minor releases can break APIs)
+jax>=0.9.0,<0.10
+jaxlib>=0.9.0,<0.10
 
 # Numerical computing
 numpy>=1.24.0
+scipy>=1.10.0
 
 # GUI and visualization
 pyqt6>=6.4.0
 pyqtgraph>=0.13.0
 matplotlib>=3.5.0
-PyOpenGL>=3.1.0
 
-# Freeform drawing
-pygame>=2.5.0
-scipy>=1.10.0
+# Freeform drawing (pygame-ce: maintained drop-in fork with wheels for current Python)
+pygame-ce>=2.5.0
 
-# Airfoil analysis
-pyxfoil
+# Neural operator pressure solvers and training
+equinox>=0.11.0
+optax>=0.2.0
+
+# Video recording (Record / Save Video)
+imageio[ffmpeg]>=2.30.0
+
+# Optional: urban building obstacles from GIS data (obstacles/building_loader.py)
+# geopandas
+# shapely
