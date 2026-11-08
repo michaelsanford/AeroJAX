@@ -18,7 +18,9 @@ from scipy.ndimage import rotate
 
 class LBMSolver:
     """Lattice Boltzmann Method solver with BaselineSolver-compatible interface"""
-    
+
+    MAX_HISTORY = 20000  # Per-step history entries kept (time, dt)
+
     def __init__(self,
                  grid: GridParams,
                  flow: FlowParams,
@@ -497,12 +499,8 @@ class LBMSolver:
         # Update the custom mask in sim_params
         self.sim_params.custom_mask = jnp.array(rotated_mask)
         
-        # Recompute mask with rotated custom mask
+        # Recompute mask with rotated custom mask (a traced step input, so no recompile)
         self.mask = self._compute_mask()
-        
-        # Clear JIT cache since mask changed
-        self._jit_cache = {}
-        self._step_jit = self.get_step_jit()
     
     def apply_vorticity_confinement(self, f: jnp.ndarray, u: jnp.ndarray, v: jnp.ndarray, 
                                    epsilon: float, cx: jnp.ndarray, cy: jnp.ndarray, 
@@ -844,12 +842,6 @@ class LBMSolver:
 
         if not use_mrt:
             # BGK collision with optional LES
-            use_les = self.lbm_params.use_les
-            les_model = self.lbm_params.les_model
-            smagorinsky_constant = self.lbm_params.smagorinsky_constant
-            dx = self.grid.dx
-            dy = self.grid.dy
-            
             f_post = collision_step(f, rho, u, v, cx, cy, w, cs_squared, omega,
                                    use_les=use_les, les_model=les_model,
                                    smagorinsky_constant=smagorinsky_constant,
@@ -1026,6 +1018,9 @@ class LBMSolver:
         # Update history
         self.history['time'].append(self.iteration * self.dt)
         self.history['dt'].append(self.dt)
+        if len(self.history['time']) > self.MAX_HISTORY:
+            del self.history['time'][:-self.MAX_HISTORY]
+            del self.history['dt'][:-self.MAX_HISTORY]
         
         return self.u, self.v, self.p
 
@@ -1091,7 +1086,9 @@ class LBMSolver:
             div = divergence_nonperiodic(u, v, self.grid.dx, self.grid.dy)
         
         # Compute airfoil metrics if enabled (same as baseline solver)
-        if self.compute_airfoil_metrics and hasattr(self.sim_params, 'flow_type') and self.sim_params.flow_type == 'von_karman':
+        # Airfoil metrics copy fields to host and run numpy analysis, so only every metrics_frame_skip steps
+        metrics_due = self.metrics_frame_skip <= 1 or self.iteration % self.metrics_frame_skip == 0
+        if metrics_due and self.compute_airfoil_metrics and hasattr(self.sim_params, 'flow_type') and self.sim_params.flow_type == 'von_karman':
             try:
                 import numpy as np
                 from solver.metrics import (
@@ -1163,7 +1160,7 @@ class LBMSolver:
                     
                     cl_history = np.array(self.history['airfoil_metrics']['CL'])
                     cd_history = np.array(self.history['airfoil_metrics']['CD'])
-                    times = np.array(self.history['time'])
+                    times = np.array(self.history['airfoil_metrics']['time'])
                     
                     is_stable, stable_start, strouhal = detect_vortex_shedding_stability(
                         cl_history, times, self.flow.U_inf, chord_length
